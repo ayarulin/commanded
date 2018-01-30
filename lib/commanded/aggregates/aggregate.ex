@@ -190,36 +190,47 @@ defmodule Commanded.Aggregates.Aggregate do
   end
 
   # Load events from the event store, in batches, to rebuild the aggregate state
-  defp rebuild_from_events(%Aggregate{aggregate_module: aggregate_module, aggregate_uuid: aggregate_uuid, aggregate_version: aggregate_version} = state) do
+  defp rebuild_from_events(%Aggregate{} = state) do
+    %Aggregate{
+      aggregate_uuid: aggregate_uuid,
+      aggregate_version: aggregate_version
+    } = state
+
     case EventStore.stream_forward(aggregate_uuid, aggregate_version + 1, @read_event_batch_size) do
       {:error, :stream_not_found} ->
-        # aggregate does not exist so return initial state
+        # aggregate does not exist, return initial state
         state
 
       event_stream ->
-        # rebuild aggregate state from event stream
-        event_stream
-        |> Stream.map(fn event ->
-          {event.data, event.stream_version}
-        end)
-        |> Stream.transform(state, fn ({event, stream_version}, state) ->
-          case event do
-            nil -> {:halt, state}
-            event ->
-              state = %Aggregate{state |
-                aggregate_version: stream_version,
-                aggregate_state: aggregate_module.apply(state.aggregate_state, event),
-              }
+        rebuild_from_event_stream(event_stream, state)
+    end
+  end
 
-              {[state], state}
-          end
-        end)
-        |> Stream.take(-1)
-        |> Enum.at(0)
-        |> case do
-          nil -> state
-          state -> state
-        end
+  # Rebuild aggregate state from a `Stream` of its events
+  defp rebuild_from_event_stream(event_stream, %Aggregate{} = state) do
+    %Aggregate{aggregate_module: aggregate_module} = state
+
+    event_stream
+    |> Stream.map(fn event ->
+      {event.data, event.stream_version}
+    end)
+    |> Stream.transform(state, fn ({event, stream_version}, state) ->
+      case event do
+        nil -> {:halt, state}
+        event ->
+          state = %Aggregate{state |
+            aggregate_version: stream_version,
+            aggregate_state: aggregate_module.apply(state.aggregate_state, event),
+          }
+
+          {[state], state}
+      end
+    end)
+    |> Stream.take(-1)
+    |> Enum.at(0)
+    |> case do
+      nil -> state
+      state -> state
     end
   end
 
@@ -243,7 +254,7 @@ defmodule Commanded.Aggregates.Aggregate do
     Map.get(metadata, "snapshot_version", 1) == expected_version
   end
 
-  # do snapshot aggregate state
+  # take a snapshot now?
   defp snapshot_required?(%Aggregate{aggregate_version: aggregate_version, snapshot_every: snapshot_every, snapshot_version: snapshot_version})
     when aggregate_version - snapshot_version >= snapshot_every, do: true
 
@@ -267,38 +278,66 @@ defmodule Commanded.Aggregates.Aggregate do
       metadata: %{"snapshot_version" => aggregate_version}
     }
 
-    Logger.debug(fn -> "Recording snapshot of aggregate state for: #{inspect aggregate_uuid}@#{aggregate_version} (#{inspect aggregate_module})" end)
+    Logger.debug(fn -> inspect(state) <> " recording snapshot" end)
 
     :ok = EventStore.record_snapshot(snapshot)
 
     %Aggregate{state | snapshot_version: aggregate_version}
   end
 
-  defp execute_command(
-    %ExecutionContext{handler: handler, function: function, command: command} = context,
-    %Aggregate{aggregate_module: aggregate_module, aggregate_version: expected_version, aggregate_state: aggregate_state} = state)
-  do
-    case Kernel.apply(handler, function, [aggregate_state, command]) do
-      {:error, _reason} = reply ->
+  defp execute_command(%ExecutionContext{retry_attempts: retry_attempts}, %Aggregate{} = state)
+    when retry_attempts < 0, do: {{:error, :too_many_attempts}, state}
+
+  defp execute_command(%ExecutionContext{} = context, %Aggregate{} = state) do
+    %ExecutionContext{
+      command: command,
+      handler: handler,
+      function: function,
+      retry_attempts: retry_attempts
+    } = context
+
+    %Aggregate{
+      aggregate_module: aggregate_module,
+      aggregate_version: expected_version,
+      aggregate_state: aggregate_state
+    } = state
+
+    {reply, state} =
+      case Kernel.apply(handler, function, [aggregate_state, command]) do
+        {:error, _reason} = reply ->
+          {reply, state}
+
+        none when none in [nil, []] ->
+          {{:ok, expected_version, []}, state}
+
+        %Commanded.Aggregate.Multi{} = multi ->
+          case Commanded.Aggregate.Multi.run(multi) do
+            {:error, _reason} = reply ->
+              {reply, state}
+
+            {aggregate_state, pending_events} ->
+              persist_events(pending_events, aggregate_state, context, state)
+          end
+
+        events ->
+          pending_events = List.wrap(events)
+          aggregate_state = apply_events(aggregate_module, aggregate_state, pending_events)
+
+          persist_events(pending_events, aggregate_state, context, state)
+      end
+
+    case reply do
+      {:error, :wrong_expected_version} ->
+        Logger.debug(fn -> inspect(state) <> " wrong expected version, retrying command" end)
+
+        # fetch missing events from event store
+        state = rebuild_from_events(state)
+
+        # retry command, but decrement retry attempts (to prevent infinite attempts)
+        execute_command(%ExecutionContext{context | retry_attempts: retry_attempts - 1}, state)
+
+      reply ->
         {reply, state}
-
-      none when none in [nil, []] ->
-        {{:ok, expected_version, []}, state}
-
-      %Commanded.Aggregate.Multi{} = multi ->
-        case Commanded.Aggregate.Multi.run(multi) do
-          {:error, _reason} = reply ->
-            {reply, state}
-
-          {aggregate_state, pending_events} ->
-            persist_events(pending_events, aggregate_state, context, state)
-        end
-
-      events ->
-        pending_events = List.wrap(events)
-        aggregate_state = apply_events(aggregate_module, aggregate_state, pending_events)
-
-        persist_events(pending_events, aggregate_state, context, state)
     end
   end
 
